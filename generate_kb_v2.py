@@ -1,5 +1,5 @@
 # generate_kb_v2.py
-# Production-safe ChromaDB knowledge base builder
+# Hardened production-safe KB builder
 
 import os
 import pandas as pd
@@ -8,10 +8,6 @@ from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# ─────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────
 
 CHROMA_PATH = "chroma_db"
 
@@ -23,9 +19,7 @@ EMBEDDING_MODEL = "text-embedding-3-large"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
-# ─────────────────────────────────────────────────────────────
-# EMBEDDING FUNCTION
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def get_embedding_function():
 
@@ -40,84 +34,118 @@ def get_embedding_function():
     )
 
 
-# ─────────────────────────────────────────────────────────────
-# DATA CLEANING UTILITIES
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# STRICT TEXT VALIDATION
+# ─────────────────────────────────────────────
 
-def clean_text_column(df, column):
+def clean_and_validate(df, text_column, id_column):
 
-    if column not in df.columns:
+    print(f"Validating {text_column}")
+
+    if text_column not in df.columns:
         raise ValueError(
-            f"Column '{column}' not found in CSV"
+            f"{text_column} column missing"
         )
 
-    print(f"Cleaning column: {column}")
+    if id_column not in df.columns:
+        raise ValueError(
+            f"{id_column} column missing"
+        )
 
-    df[column] = (
-        df[column]
+    df[text_column] = (
+        df[text_column]
         .fillna("")
         .astype(str)
         .str.strip()
     )
 
-    # Remove empty rows
-    df = df[
-        df[column] != ""
-    ]
-
-    # Limit length (safety)
-    df[column] = df[column].str[:8000]
-
-    print(
-        f"Remaining rows after cleaning: {len(df)}"
-    )
-
-    if len(df) == 0:
-        raise ValueError(
-            f"No valid data found in column '{column}'"
-        )
-
-    return df
-
-
-def validate_ids(df, column):
-
-    if column not in df.columns:
-        raise ValueError(
-            f"ID column '{column}' not found"
-        )
-
-    df[column] = (
-        df[column]
+    df[id_column] = (
+        df[id_column]
         .astype(str)
         .str.strip()
     )
 
-    df = df[
-        df[column] != ""
-    ]
+    valid_rows = []
+    removed = 0
 
-    if df[column].duplicated().any():
+    for _, row in df.iterrows():
 
-        duplicates = df[
-            df[column].duplicated()
-        ][column].tolist()
+        text = row[text_column]
+        rid = row[id_column]
 
+        if not text:
+            removed += 1
+            continue
+
+        if len(text) < 2:
+            removed += 1
+            continue
+
+        if text.isspace():
+            removed += 1
+            continue
+
+        if not rid:
+            removed += 1
+            continue
+
+        valid_rows.append(row)
+
+    df = pd.DataFrame(valid_rows)
+
+    print(
+        f"Valid rows: {len(df)}"
+    )
+
+    print(
+        f"Removed rows: {removed}"
+    )
+
+    if len(df) == 0:
         raise ValueError(
-            f"Duplicate IDs detected: {duplicates[:5]}"
+            f"No valid rows found in {text_column}"
         )
 
     return df
 
 
-# ─────────────────────────────────────────────────────────────
-# MAIN BUILD FUNCTION
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SAFE BATCH INSERT
+# ─────────────────────────────────────────────
+
+def insert_in_batches(
+    collection,
+    ids,
+    documents,
+    metadatas,
+    batch_size=100,
+):
+
+    total = len(ids)
+
+    for i in range(0, total, batch_size):
+
+        batch_ids = ids[i:i + batch_size]
+        batch_docs = documents[i:i + batch_size]
+        batch_meta = metadatas[i:i + batch_size]
+
+        print(
+            f"Inserting batch "
+            f"{i} → {i + len(batch_ids)}"
+        )
+
+        collection.add(
+            ids=batch_ids,
+            documents=batch_docs,
+            metadatas=batch_meta,
+        )
+
+
+# ─────────────────────────────────────────────
 
 def build_kb():
 
-    print()
-    print("Initializing ChromaDB...")
+    print("Initializing ChromaDB")
 
     chroma = chromadb.PersistentClient(
         path=CHROMA_PATH
@@ -125,31 +153,19 @@ def build_kb():
 
     embed_fn = get_embedding_function()
 
-    # ─────────────────────────────────────────────────────────
-    # RESET COLLECTIONS
-    # ─────────────────────────────────────────────────────────
-
     try:
         chroma.delete_collection(
             PRODUCTS_COLLECTION
         )
-        print("Deleted old products collection")
-
     except Exception:
-        print("No existing products collection")
+        pass
 
     try:
         chroma.delete_collection(
             VIDEOS_COLLECTION
         )
-        print("Deleted old videos collection")
-
     except Exception:
-        print("No existing videos collection")
-
-    # ─────────────────────────────────────────────────────────
-    # CREATE COLLECTIONS
-    # ─────────────────────────────────────────────────────────
+        pass
 
     products_col = chroma.get_or_create_collection(
         name=PRODUCTS_COLLECTION,
@@ -161,125 +177,103 @@ def build_kb():
         embedding_function=embed_fn,
     )
 
-    # ─────────────────────────────────────────────────────────
-    # LOAD CSV FILES
-    # ─────────────────────────────────────────────────────────
-
-    print()
-    print("Loading CSV files...")
-
-    if not os.path.exists("products.csv"):
-        raise FileNotFoundError(
-            "products.csv not found"
-        )
-
-    if not os.path.exists("videos.csv"):
-        raise FileNotFoundError(
-            "videos.csv not found"
-        )
+    print("Loading CSV files")
 
     df_products = pd.read_csv(
-        "products.csv"
+        "products.csv",
+        encoding="utf-8",
     )
 
     df_videos = pd.read_csv(
-        "videos.csv"
+        "videos.csv",
+        encoding="utf-8",
     )
 
     print(
-        f"Products loaded: {len(df_products)}"
+        "Products loaded:",
+        len(df_products)
     )
 
     print(
-        f"Videos loaded: {len(df_videos)}"
+        "Videos loaded:",
+        len(df_videos)
     )
 
-    # ─────────────────────────────────────────────────────────
-    # CLEAN DATA
-    # ─────────────────────────────────────────────────────────
-
-    df_products = validate_ids(
+    df_products = clean_and_validate(
         df_products,
-        "product_id"
+        text_column="name",
+        id_column="product_id",
     )
 
-    df_products = clean_text_column(
-        df_products,
-        "name"
-    )
-
-    df_videos = validate_ids(
+    df_videos = clean_and_validate(
         df_videos,
-        "video_id"
+        text_column="title",
+        id_column="video_id",
     )
 
-    df_videos = clean_text_column(
-        df_videos,
-        "title"
+    print("Preparing product data")
+
+    product_ids = (
+        df_products["product_id"]
+        .astype(str)
+        .tolist()
     )
 
-    # ─────────────────────────────────────────────────────────
-    # INSERT PRODUCTS
-    # ─────────────────────────────────────────────────────────
-
-    print()
-    print("Inserting products...")
-
-    products_col.add(
-
-        ids=df_products[
-            "product_id"
-        ].tolist(),
-
-        documents=df_products[
-            "name"
-        ].tolist(),
-
-        metadatas=df_products.to_dict(
-            "records"
-        ),
+    product_docs = (
+        df_products["name"]
+        .astype(str)
+        .tolist()
     )
 
-    print(
-        f"Products inserted: {len(df_products)}"
+    product_meta = (
+        df_products
+        .to_dict("records")
     )
 
-    # ─────────────────────────────────────────────────────────
-    # INSERT VIDEOS
-    # ─────────────────────────────────────────────────────────
+    print("Preparing video data")
 
-    print()
-    print("Inserting videos...")
-
-    videos_col.add(
-
-        ids=df_videos[
-            "video_id"
-        ].tolist(),
-
-        documents=df_videos[
-            "title"
-        ].tolist(),
-
-        metadatas=df_videos.to_dict(
-            "records"
-        ),
+    video_ids = (
+        df_videos["video_id"]
+        .astype(str)
+        .tolist()
     )
 
-    print(
-        f"Videos inserted: {len(df_videos)}"
+    video_docs = (
+        df_videos["title"]
+        .astype(str)
+        .tolist()
     )
 
-    # ─────────────────────────────────────────────────────────
+    video_meta = (
+        df_videos
+        .to_dict("records")
+    )
 
-    print()
+    print("Inserting products")
+
+    insert_in_batches(
+        products_col,
+        product_ids,
+        product_docs,
+        product_meta,
+    )
+
+    print("Inserting videos")
+
+    insert_in_batches(
+        videos_col,
+        video_ids,
+        video_docs,
+        video_meta,
+    )
+
     print("Knowledge base ready")
+
     print(
-        f"Location: {CHROMA_PATH}"
+        "Location:",
+        CHROMA_PATH
     )
 
-
-# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
