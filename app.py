@@ -39,7 +39,7 @@ from openai import OpenAI
 from PIL import Image
 from sklearn.cluster import KMeans
 from dotenv import load_dotenv
-
+from generate_kb_v2 import build_kb
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -60,6 +60,78 @@ CHROMA_PATH       = "chroma_db"  # must match generate_kb_v2.py
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 CHAT_MODEL        = "gpt-4o-mini"
 EMBEDDING_MODEL   = "text-embedding-3-large"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO BUILD KNOWLEDGE BASE (STREAMLIT SAFE)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ensure_kb_exists():
+    """
+    Ensures ChromaDB exists.
+    If collections are missing, builds the KB automatically.
+
+    Safe for:
+    - Streamlit Cloud
+    - Docker
+    - Local
+    - CI/CD
+    """
+
+    if not OPENAI_API_KEY:
+        print("OPENAI_API_KEY missing — cannot build KB")
+        return False
+
+    try:
+
+        embed_fn = embedding_functions.OpenAIEmbeddingFunction(
+            api_key=OPENAI_API_KEY,
+            model_name=EMBEDDING_MODEL,
+        )
+
+        chroma = chromadb.PersistentClient(
+            path=CHROMA_PATH
+        )
+
+        # Verify collections exist
+        chroma.get_collection(
+            name="products",
+            embedding_function=embed_fn,
+        )
+
+        chroma.get_collection(
+            name="videos",
+            embedding_function=embed_fn,
+        )
+
+        print("Knowledge base already exists")
+
+        return True
+
+    except Exception:
+
+        print("Knowledge base missing — building now...")
+
+        try:
+
+            build_kb()
+
+            print("Knowledge base successfully created")
+
+            return True
+
+        except Exception as e:
+
+            print("KB build failed:", e)
+
+            return False
+
+
+@st.cache_resource
+def initialize_kb():
+
+    return ensure_kb_exists()
+
+initialize_kb()
 # Base64 inline SVG — always loads, no external dependency
 PLACEHOLDER_IMAGE = (
     "data:image/svg+xml;base64,"
