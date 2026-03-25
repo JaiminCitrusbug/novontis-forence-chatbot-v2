@@ -213,7 +213,7 @@ temp/
 temp_files/
 temp_folder/
 temp_data/
-
+working_files/
 #Chroma db
 chroma_db/
 chroma_db_v2/

@@ -4,15 +4,18 @@ Forence AI — Beauty Assistant with Face Analysis
 Combines:
   • MediaPipe face-mesh analysis (shape, skin tone, texture)
   • Forence warm-persona chatbot with structured JSON signals
-  • ChromaDB semantic product search + ranked product cards
+  • LIVE Amazon product search via SerpAPI (key rotation) + GPT fallback
   • Affiliate waterfall (CJ → Rakuten → Amazon → Google fallback)
   • Silent user-profile builder
   • Clarifying-question & off-topic-redirect logic
 
 Run:
     export OPENAI_API_KEY=sk-...
-    python generate_kb_v2.py          # build knowledge base first
+    export SERPAPI_KEYS=key1,key2,key3
     streamlit run face_analysis.py
+
+NOTE: ChromaDB / generate_kb_v2 are intentionally disabled.
+      Products are now fetched live from Amazon at query time.
 """
 
 import os
@@ -28,18 +31,28 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 import io
 import json
 import math
+import re
+import time
+import uuid
 
-import chromadb
+# ── Standard HTTP client (for SerpAPI calls) ──────────────────────────────
+import requests
+
+# ── Core imports ──────────────────────────────────────────────────────────
 import cv2
 import mediapipe as mp
 import numpy as np
 import streamlit as st
-from chromadb.utils import embedding_functions
 from openai import OpenAI
 from PIL import Image
 from sklearn.cluster import KMeans
 from dotenv import load_dotenv
-from generate_kb_v2 import build_kb
+
+# ── ChromaDB — DISABLED (live search replaces KB lookup) ──────────────────
+# import chromadb
+# from chromadb.utils import embedding_functions
+# from generate_kb_v2 import build_kb
+
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -56,92 +69,18 @@ st.set_page_config(
 # APP-LEVEL CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHROMA_PATH       = "chroma_db"  # must match generate_kb_v2.py
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-CHAT_MODEL        = "gpt-4o-mini"
-EMBEDDING_MODEL   = "text-embedding-3-large"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CHAT_MODEL     = "gpt-4o-mini"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# AUTO BUILD KNOWLEDGE BASE (STREAMLIT SAFE)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def ensure_kb_exists():
-    """
-    Ensures ChromaDB exists.
-    If collections are missing, builds the KB automatically.
-
-    Safe for:
-    - Streamlit Cloud
-    - Docker
-    - Local
-    - CI/CD
-    """
-
-    if not OPENAI_API_KEY:
-        print("OPENAI_API_KEY missing — cannot build KB")
-        return False
-
-    try:
-
-        embed_fn = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=OPENAI_API_KEY,
-            model_name=EMBEDDING_MODEL,
-        )
-
-        chroma = chromadb.PersistentClient(
-            path=CHROMA_PATH
-        )
-
-        # Verify collections exist
-        chroma.get_collection(
-            name="products",
-            embedding_function=embed_fn,
-        )
-
-        chroma.get_collection(
-            name="videos",
-            embedding_function=embed_fn,
-        )
-
-        print("Knowledge base already exists")
-
-        return True
-
-    except Exception:
-
-        print("Knowledge base missing — building now...")
-
-        try:
-
-            build_kb()
-
-            print("Knowledge base successfully created")
-
-            return True
-
-        except Exception as e:
-
-            print("KB build failed:", e)
-
-            return False
-
-
-@st.cache_resource
-def initialize_kb():
-
-    return ensure_kb_exists()
-
-initialize_kb()
-# Base64 inline SVG — always loads, no external dependency
-PLACEHOLDER_IMAGE = (
-    "data:image/svg+xml;base64,"
-    "PHN2ZyB3aWR0aD0iMTUwIiBoZWlnaHQ9IjE1MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMu"
-    "b3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTUwIiBoZWlnaHQ9IjE1MCIgZmlsbD0i"
-    "I2YwZTBkNCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBkb21pbmFudC1iYXNlbGluZT0i"
-    "bWlkZGxlIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LWZhbWlseT0ic2Fucy1zZXJp"
-    "ZiIgZm9udC1zaXplPSIxMiIgZmlsbD0iIzlhNzA2MCI+Tm8gSW1hZ2U8L3RleHQ+PC9z"
-    "dmc+"
-)
+# ── SerpAPI key pool ──────────────────────────────────────────────────────
+# Set in .env as a comma-separated list:
+#   SERPAPI_KEYS=key1,key2,key3
+# Each key is a free-tier SerpAPI account (100 searches/month each).
+SERPAPI_KEYS: list[str] = [
+    k.strip()
+    for k in os.getenv("SERPAPI_KEYS", "").split(",")
+    if k.strip()
+]
 
 # Brand → preferred affiliate network override.
 BRAND_AFFILIATE_OVERRIDES: dict[str, str] = {}
@@ -230,44 +169,103 @@ st.markdown(
         color: #5a2a0a !important;
     }
 
-    /* ── Product cards ── */
+    /* ── Product cards ──
+       Each card sits inside its own st.columns() cell.
+       Flexbox + fixed min-heights per row keep name / brand / stars / price
+       / button aligned at the same vertical position across all 4 columns.
+    ── */
     .f-card {
         border: 1px solid #edddd4;
         border-radius: 14px;
         padding: 14px 12px;
         background: #fffaf6;
         text-align: center;
-        min-height: 340px;
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 6px;
+        gap: 0;
         box-shadow: 0 2px 8px rgba(160,80,40,0.06);
-        margin-bottom: 8px;
+        height: 100%;
     }
+    /* Image slot REMOVED — kept as comment for easy re-enable:
     .f-card img {
         width: 100%;
         height: 130px;
         object-fit: cover;
         border-radius: 10px;
+        margin-bottom: 8px;
     }
-    .f-card-name  { font-weight: 700; font-size: 0.82rem; color: #2b1a1a; line-height: 1.35; }
-    .f-card-brand { color: #b08060; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
-    .f-card-stars { color: #e8912a; font-size: 0.82rem; margin: 2px 0; }
+    */
+
+    /* Fixed-height zones — every card row occupies the same vertical space */
+    .f-card-name {
+        font-weight: 700;
+        font-size: 0.80rem;
+        color: #2b1a1a;
+        line-height: 1.35;
+        min-height: 52px;        /* room for 3 lines max */
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        width: 100%;
+        margin-bottom: 6px;
+    }
+    .f-card-brand {
+        color: #b08060;
+        font-size: 0.70rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        min-height: 20px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        width: 100%;
+        margin-bottom: 4px;
+    }
+    .f-card-stars {
+        color: #e8912a;
+        font-size: 0.80rem;
+        min-height: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 2px;
+        margin-bottom: 4px;
+    }
     .f-card-rating-count { color: #aaa; font-size: 0.68rem; }
-    .f-card-price { font-weight: 800; font-size: 0.95rem; color: #2b1a1a; }
-    .f-card-price-na { color: #ccc; font-size: 0.78rem; }
+    .f-card-price {
+        font-weight: 800;
+        font-size: 0.92rem;
+        color: #2b1a1a;
+        min-height: 26px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 10px;
+    }
+    .f-card-price-na {
+        color: #ccc;
+        font-size: 0.75rem;
+        min-height: 26px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 10px;
+    }
     .f-shop-btn {
-        display: inline-block;
+        display: block;
         background: linear-gradient(135deg, #c96a40, #e08050);
         color: #fff !important;
         text-decoration: none !important;
-        padding: 7px 20px;
+        padding: 8px 0;
         border-radius: 20px;
-        font-size: 0.78rem;
+        font-size: 0.76rem;
         font-weight: 700;
-        margin-top: auto;
         transition: opacity .15s;
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: auto;
     }
     .f-shop-btn:hover { opacity: .85; }
     .f-disclosure { font-size: 0.68rem; color: #c0a090; font-style: italic; margin: 2px 0 8px 0; }
@@ -351,31 +349,6 @@ st.markdown(
 # ══════════════════════════════════════════════════════════════════════════════
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHROMADB — CACHED PRODUCT COLLECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_resource
-def get_chroma_collections():
-    """
-    Returns (products_collection, videos_collection, kb_available).
-    Safe to call even if the KB hasn't been built yet.
-    """
-    if not OPENAI_API_KEY:
-        return None, None, False
-    try:
-        embed_fn = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=OPENAI_API_KEY,
-            model_name=EMBEDDING_MODEL,
-        )
-        chroma = chromadb.PersistentClient(path=CHROMA_PATH)
-        products = chroma.get_collection(name="products", embedding_function=embed_fn)
-        videos = chroma.get_collection(name="videos", embedding_function=embed_fn)
-        return products, videos, True
-    except Exception:
-        return None, None, False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -502,64 +475,57 @@ def extract_deep_face_features(pil_image):
         raise ValueError("No face detected")
 
     lm = results.multi_face_landmarks[0].landmark
-    left = to_point(lm[234], w, h)
-    right = to_point(lm[454], w, h)
-    forehead_top = to_point(lm[10], w, h)
-    chin = to_point(lm[152], w, h)
-    jaw_left = to_point(lm[172], w, h)
-    jaw_right = to_point(lm[397], w, h)
-    cheek_left = to_point(lm[93], w, h)
-    cheek_right = to_point(lm[323], w, h)
-    forehead_left = to_point(lm[70], w, h)
+    left         = to_point(lm[234], w, h)
+    right        = to_point(lm[454], w, h)
+    forehead_top = to_point(lm[10],  w, h)
+    chin         = to_point(lm[152], w, h)
+    jaw_left     = to_point(lm[172], w, h)
+    jaw_right    = to_point(lm[397], w, h)
+    cheek_left   = to_point(lm[93],  w, h)
+    cheek_right  = to_point(lm[323], w, h)
+    forehead_left  = to_point(lm[70],  w, h)
     forehead_right = to_point(lm[300], w, h)
 
-    face_width = distance(left, right)
-    face_height = distance(forehead_top, chin)
-    jaw_width = distance(jaw_left, jaw_right)
-    cheek_width = distance(cheek_left, cheek_right)
+    face_width     = distance(left, right)
+    face_height    = distance(forehead_top, chin)
+    jaw_width      = distance(jaw_left, jaw_right)
+    cheek_width    = distance(cheek_left, cheek_right)
     forehead_width = distance(forehead_left, forehead_right)
 
-    face_shape = classify_face_shape(
+    face_shape  = classify_face_shape(
         face_width, face_height, jaw_width, cheek_width, forehead_width
     )
     skin_region = sample_skin_region(image, lm)
-    skin_color = analyze_skin_color(skin_region)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    texture = analyze_texture(gray)
+    skin_color  = analyze_skin_color(skin_region)
+    gray        = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    texture     = analyze_texture(gray)
 
     return {
         "face_shape": face_shape,
         "facial_dimensions": {
-            "face_width_px": face_width,
-            "face_height_px": face_height,
-            "jaw_width_px": jaw_width,
+            "face_width_px":      face_width,
+            "face_height_px":     face_height,
+            "jaw_width_px":       jaw_width,
             "cheekbone_width_px": cheek_width,
-            "forehead_width_px": forehead_width,
+            "forehead_width_px":  forehead_width,
             "height_width_ratio": face_height / face_width,
         },
-        "skin_color": skin_color,
+        "skin_color":     skin_color,
         "texture_metrics": texture,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FORENCE SYSTEM PROMPT — with face features + user profile
+# FORENCE SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_system_prompt(profile: dict, features: dict | None) -> str:
-    """
-    Builds the Forence persona prompt, injecting:
-      • face-analysis results (shape, undertone, brightness, texture)
-      • accumulated user profile (skin type, concerns, preferences)
-    """
-
-    # ── Face-analysis context ────────────────────────────────────────────
     face_ctx = ""
     if features:
-        shape = features["face_shape"]
-        undertone = features["skin_color"]["undertone"]
-        brightness = features["skin_color"]["brightness"]
-        variance = features["texture_metrics"]["variance"]
+        shape       = features["face_shape"]
+        undertone   = features["skin_color"]["undertone"]
+        brightness  = features["skin_color"]["brightness"]
+        variance    = features["texture_metrics"]["variance"]
         bright_label = (
             "fair" if brightness > 180 else "medium" if brightness > 100 else "deep"
         )
@@ -573,7 +539,6 @@ def build_system_prompt(profile: dict, features: dict | None) -> str:
             f"reading analysis data."
         )
 
-    # ── Silent user profile ──────────────────────────────────────────────
     profile_ctx = ""
     if profile:
         parts = []
@@ -657,25 +622,21 @@ Your "reply" text is rendered as Markdown inside a Streamlit chat bubble.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _FALLBACK_SIGNALS = {
-    "show_products": False,
-    "product_query": None,
-    "product_filters": {},
+    "show_products":      False,
+    "product_query":      None,
+    "product_filters":    {},
     "needs_clarification": False,
-    "is_off_topic": False,
-    "profile_updates": {},
+    "is_off_topic":       False,
+    "profile_updates":    {},
 }
 
 
 def get_forence_response(
     user_input: str,
-    history: list[dict],
-    profile: dict,
-    features: dict | None,
+    history:    list[dict],
+    profile:    dict,
+    features:   dict | None,
 ) -> dict:
-    """
-    Returns {'reply': str, 'signals': dict}.
-    Always safe — returns fallback on any error.
-    """
     messages = [
         {"role": "system", "content": build_system_prompt(profile, features)}
     ]
@@ -692,7 +653,7 @@ def get_forence_response(
             max_tokens=900,
             response_format={"type": "json_object"},
         )
-        raw = resp.choices[0].message.content.strip()
+        raw    = resp.choices[0].message.content.strip()
         parsed = json.loads(raw)
 
         parsed.setdefault(
@@ -706,70 +667,463 @@ def get_forence_response(
 
     except json.JSONDecodeError:
         return {
-            "reply": raw or "Something went wrong — please try again!",
+            "reply":   raw or "Something went wrong — please try again!",
             "signals": _FALLBACK_SIGNALS,
         }
     except Exception as e:
         return {
-            "reply": f"Something went wrong on my end — please try again! ({e})",
+            "reply":   f"Something went wrong on my end — please try again! ({e})",
             "signals": _FALLBACK_SIGNALS,
         }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRODUCT SEARCH  (ChromaDB semantic query)
+# ── LIVE PRODUCT SEARCH ENGINE ────────────────────────────────────────────────
+# Architecture:
+#   1. SerpAPI key rotation  — tries each key in pool, skips exhausted ones
+#   2. GPT-4o-mini fallback  — if ALL SerpAPI keys fail, GPT returns real
+#                              brand names + direct Amazon product page URLs
 # ══════════════════════════════════════════════════════════════════════════════
 
-def query_products(query: str, filters: dict, n_results: int = 12) -> list[dict]:
-    products_col, _, kb_ok = get_chroma_collections()
-    if not kb_ok or products_col is None:
-        return []
+# ── Known beauty brands for title→brand extraction ────────────────────────
+_KNOWN_BRANDS = [
+    "Neutrogena", "Cetaphil", "CeraVe", "L'Oreal", "Loreal", "Maybelline",
+    "NYX", "MAC", "Clinique", "Estee Lauder", "Lancome", "Shiseido",
+    "Olay", "Garnier", "Nivea", "Dove", "Ponds", "Lakme", "Lotus",
+    "Biotique", "Himalaya", "Mamaearth", "Plum", "mCaffeine",
+    "Minimalist", "Re'equil", "Fixderma", "The Derma Co", "Foxtale",
+    "Pilgrim", "WOW", "St.Botanica", "Forest Essentials",
+    "Kama Ayurveda", "VLCC", "Jovees", "Everyuth", "Vaseline",
+    "La Roche-Posay", "Vichy", "Avene", "Bioderma", "COSRX",
+    "The Ordinary", "Paula's Choice", "Drunk Elephant", "Tatcha",
+    "Sunday Riley", "Glow Recipe", "Innisfree", "Laneige",
+    "Revlon", "Colorbar", "Sugar", "Faces Canada", "Nykaa",
+    "Schwarzkopf", "Pantene", "TRESemme", "OGX", "Moroccanoil",
+    "Charlotte Tilbury", "Urban Decay", "Too Faced", "Benefit",
+    "NARS", "Fenty", "Pat McGrath", "Huda Beauty", "Rare Beauty",
+    "e.l.f.", "Wet n Wild", "Milani", "ColourPop", "Indulekha",
+]
 
-    def run_query(where: dict | None) -> list[dict]:
-        kwargs: dict = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-        try:
-            res = products_col.query(**kwargs)
-        except Exception:
-            return []
-        if not res.get("metadatas") or not res["metadatas"][0]:
-            return []
-        out = []
-        for meta, dist in zip(res["metadatas"][0], res["distances"][0]):
-            meta["_distance"] = float(dist)
-            out.append(meta)
-        return out
 
-    # Build where-clause
-    conditions = []
-    if filters:
-        skin = filters.get("skin_type")
-        if skin and skin not in (None, "null", "all"):
-            conditions.append({"skin_type": {"$in": [skin, "all"]}})
-        concern = filters.get("concerns")
-        if concern and concern not in (None, "null"):
-            conditions.append({"concerns": {"$eq": concern}})
-        category = filters.get("category")
-        if category and category not in (None, "null"):
-            conditions.append({"category": {"$eq": category}})
+def _extract_brand(title: str) -> str:
+    """Match known brand name inside title, else capitalise first word."""
+    title_lower = title.lower()
+    for brand in _KNOWN_BRANDS:
+        if brand.lower() in title_lower:
+            return brand
+    return title.split()[0].capitalize() if title else "Unknown"
 
-    where_clause = (
-        None
-        if len(conditions) == 0
-        else conditions[0]
-        if len(conditions) == 1
-        else {"$and": conditions}
+
+def _parse_price(raw) -> float:
+    """'₹1,299' / '$24.99' / 24.99 → float."""
+    if not raw:
+        return 0.0
+    cleaned = re.sub(r"[^\d.]", "", str(raw))
+    try:
+        return round(float(cleaned), 2)
+    except ValueError:
+        return 0.0
+
+
+def _parse_rating(raw) -> float:
+    """'4.5 out of 5 stars' / 4.5 → float."""
+    if not raw:
+        return 0.0
+    m = re.search(r"(\d+\.?\d*)", str(raw))
+    return float(m.group(1)) if m else 0.0
+
+
+def _parse_count(raw) -> int:
+    """'1,234 ratings' / '1234' → int."""
+    if not raw:
+        return 0
+    cleaned = re.sub(r"[^\d]", "", str(raw))
+    try:
+        return int(cleaned)
+    except ValueError:
+        return 0
+
+
+def _extract_asin(url: str) -> str | None:
+    """Extract a 10-character ASIN from any Amazon URL string."""
+    m = re.search(r"/(?:dp|gp/product|product)/([A-Z0-9]{10})", url)
+    return m.group(1) if m else None
+
+
+def _build_amazon_product_url(raw_link: str, title: str) -> str:
+    """
+    CHANGE 1 — Return a direct Amazon PRODUCT PAGE url, not a search URL.
+
+    Priority order:
+      1. If raw_link already contains /dp/ASIN  →  clean canonical product URL
+      2. If raw_link contains /gp/product/ASIN  →  convert to /dp/ASIN
+      3. If raw_link contains an ASIN anywhere  →  build /dp/ASIN URL
+      4. If raw_link is any other Amazon URL    →  return it as-is (still a
+         product page in most cases — SerpAPI usually returns product links)
+      5. Last resort: Amazon India keyword SEARCH url
+         (shown only when SerpAPI gives no link at all)
+    """
+    if raw_link and "amazon" in raw_link:
+        # Try to find /dp/ASIN or /gp/product/ASIN
+        asin = _extract_asin(raw_link)
+        if asin:
+            # Normalise to the clean canonical form
+            return f"https://www.amazon.in/dp/{asin}"
+        # No ASIN found but it's still an Amazon URL — return as-is
+        # (SerpAPI product links usually go straight to the product page)
+        return raw_link
+
+    # No Amazon link at all → fall back to keyword search
+    q = re.sub(r"\s+", "+", title.strip())
+    return f"https://www.amazon.in/s?k={q}"
+
+
+def _make_product_dict(
+    title:     str,
+    image_url: str,
+    price_raw,
+    rating_raw,
+    count_raw,
+    amazon_url: str,
+    category:   str = "",
+    skin_type:  str = "all",
+    concerns:   str = "",
+    distance:   float = 0.5,
+) -> dict:
+    """
+    Assemble a product dict that matches the schema expected by
+    rank_products() and render_product_cards() exactly.
+    """
+    return {
+        "product_id":        str(uuid.uuid4()),
+        "name":              title,
+        "brand":             _extract_brand(title),
+        "category":          category,
+        "price":             _parse_price(price_raw),
+        "rating":            _parse_rating(rating_raw),
+        "rating_count":      _parse_count(count_raw),
+        "skin_type":         skin_type,
+        "concerns":          concerns,
+        # Affiliate columns — direct Amazon product URL stored in affiliate_amazon
+        "affiliate_cj":      "",
+        "affiliate_rakuten": "",
+        "affiliate_amazon":  amazon_url,
+        "image_url":         image_url or "",
+        # Ranking support
+        "_distance":         distance,
+    }
+
+
+# ── SerpAPI key rotation ──────────────────────────────────────────────────
+
+def _get_serpapi_key_pool() -> list[str]:
+    if "serpapi_key_pool" not in st.session_state:
+        st.session_state.serpapi_key_pool  = list(SERPAPI_KEYS)
+        st.session_state.serpapi_key_index = 0
+    return st.session_state.serpapi_key_pool
+
+
+def _current_serpapi_key() -> str | None:
+    pool = _get_serpapi_key_pool()
+    if not pool:
+        return None
+    idx = st.session_state.get("serpapi_key_index", 0) % len(pool)
+    return pool[idx]
+
+
+def _rotate_serpapi_key() -> str | None:
+    pool = _get_serpapi_key_pool()
+    if not pool:
+        return None
+    current = st.session_state.get("serpapi_key_index", 0)
+    next_idx = current + 1
+    if next_idx >= len(pool):
+        return None
+    st.session_state.serpapi_key_index = next_idx
+    return pool[next_idx]
+
+
+def _reset_serpapi_rotation():
+    st.session_state.serpapi_key_index = 0
+
+
+# ── Single SerpAPI call ───────────────────────────────────────────────────
+
+_SERPAPI_QUOTA_CODES = {429, 401, 403}
+
+
+def _serpapi_search(query: str, api_key: str, n: int = 5) -> list[dict]:
+    params = {
+        "engine":        "amazon",
+        "q":             query,
+        "api_key":       api_key,
+        "amazon_domain": "amazon.in",
+    }
+    try:
+        resp = requests.get(
+            "https://serpapi.com/search",
+            params=params,
+            timeout=12,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Network error: {exc}") from exc
+
+    if resp.status_code in _SERPAPI_QUOTA_CODES:
+        raise PermissionError(
+            f"SerpAPI key exhausted or invalid (HTTP {resp.status_code})"
+        )
+    if not resp.ok:
+        raise RuntimeError(f"SerpAPI HTTP {resp.status_code}")
+
+    data    = resp.json()
+    organic = data.get("organic_results") or data.get("results") or []
+    return organic[:n]
+
+
+def _serpapi_results_to_products(
+    organic: list[dict],
+    category: str,
+    skin_type: str,
+    concerns: str,
+) -> list[dict]:
+    """Convert raw SerpAPI organic results into Forence product dicts."""
+    products = []
+    for i, item in enumerate(organic):
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+
+        # CHANGE 1 — use _build_amazon_product_url (direct product page)
+        raw_link   = item.get("link") or item.get("product_link") or ""
+        amazon_url = _build_amazon_product_url(raw_link, title)
+
+        # image_url kept in dict for future use but not rendered (CHANGE 2)
+        image_url  = item.get("thumbnail") or item.get("image") or ""
+
+        price_raw = (
+            item.get("price")
+            or ((item.get("prices") or [{}])[0].get("raw", ""))
+        )
+        rating_raw = item.get("rating")
+        count_raw  = item.get("reviews_count") or item.get("ratings_total")
+
+        products.append(
+            _make_product_dict(
+                title=title,
+                image_url=image_url,
+                price_raw=price_raw,
+                rating_raw=rating_raw,
+                count_raw=count_raw,
+                amazon_url=amazon_url,
+                category=category,
+                skin_type=skin_type,
+                concerns=concerns,
+                distance=float(i) / max(len(organic), 1),
+            )
+        )
+    return products
+
+
+# ── GPT fallback ──────────────────────────────────────────────────────────
+
+# CHANGE 1 — updated GPT system prompt to request direct /dp/ASIN URLs
+_GPT_PRODUCT_SYSTEM = """You are a beauty product data assistant.
+When given a search query, return a JSON array of real beauty products
+available on Amazon India. Each element must have exactly these fields:
+  name, brand, category, price_inr (number, 0 if unknown),
+  rating (number 0–5), review_count (integer),
+  asin (10-character Amazon ASIN string, e.g. "B08XYZ1234" — required if you know it),
+  amazon_product_url (direct Amazon India product page URL in the format
+    https://www.amazon.in/dp/<ASIN>  — use the ASIN field to build this;
+    if ASIN is unknown use https://www.amazon.in/s?k=URL-encoded+product+name)
+
+Return ONLY the JSON array. No markdown, no explanation, no extra keys.
+Limit to {n} products. Use real brand names and real product names only."""
+
+
+def _gpt_product_fallback(
+    query:     str,
+    filters:   dict,
+    n:         int = 5,
+) -> list[dict]:
+    """
+    Ask GPT-4o-mini to suggest real beauty products when SerpAPI is unavailable.
+    Returns product dicts with direct Amazon product page URLs where possible.
+    """
+    category  = filters.get("category")  or ""
+    skin_type = filters.get("skin_type") or "all"
+    concerns  = filters.get("concerns")  or ""
+
+    filter_hint = ""
+    if category:
+        filter_hint += f" Category: {category}."
+    if skin_type and skin_type not in ("all", "null"):
+        filter_hint += f" For {skin_type} skin."
+    if concerns and concerns != "null":
+        filter_hint += f" Target concern: {concerns}."
+
+    user_msg = (
+        f"Search query: {query}{filter_hint}\n"
+        f"Return {n} real Amazon India beauty products as a JSON array."
     )
 
-    results = run_query(where_clause)
-    if not results and where_clause is not None:
-        results = run_query(None)
-    return results
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": _GPT_PRODUCT_SYSTEM.format(n=n),
+                },
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.3,
+            max_tokens=800,
+            response_format={"type": "json_object"},
+        )
+        raw  = resp.choices[0].message.content.strip()
+        data = json.loads(raw)
+
+        # GPT sometimes wraps the array under a key
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    data = v
+                    break
+            else:
+                return []
+
+        products = []
+        for i, item in enumerate(data[:n]):
+            title     = str(item.get("name", "")).strip()
+            brand     = str(item.get("brand", "")).strip() or _extract_brand(title)
+            cat       = str(item.get("category", category)).strip()
+            price_raw = item.get("price_inr", 0)
+            rating    = float(item.get("rating", 0) or 0)
+            count     = int(item.get("review_count", 0) or 0)
+
+            # CHANGE 1 — prefer /dp/ASIN URL provided by GPT
+            asin = str(item.get("asin", "")).strip()
+            url  = str(item.get("amazon_product_url", "")).strip()
+
+            if asin and re.fullmatch(r"[A-Z0-9]{10}", asin):
+                url = f"https://www.amazon.in/dp/{asin}"
+            elif not url:
+                q   = re.sub(r"\s+", "+", f"{title} {brand}".strip())
+                url = f"https://www.amazon.in/s?k={q}"
+
+            if not title:
+                continue
+
+            p = _make_product_dict(
+                title=title,
+                image_url="",           # GPT doesn't give images
+                price_raw=price_raw,
+                rating_raw=rating,
+                count_raw=count,
+                amazon_url=url,
+                category=cat,
+                skin_type=skin_type,
+                concerns=concerns,
+                distance=float(i) / max(n, 1),
+            )
+            p["brand"] = brand
+            products.append(p)
+
+        return products
+
+    except Exception as e:
+        print(f"[GPT fallback error] {e}")
+        return []
+
+
+# ── Main orchestrator ─────────────────────────────────────────────────────
+
+def search_products_live(
+    query:   str,
+    filters: dict,
+    n:       int = 8,
+) -> list[dict]:
+    """
+    Fetch real Amazon products for the given query.
+
+    Flow:
+      1. Try each SerpAPI key in the pool (rotation on quota/error).
+      2. If all SerpAPI keys fail → GPT-4o-mini fallback.
+      3. Returns list[dict] in the same schema as the old query_products().
+    """
+    category  = (filters.get("category")  or "").strip()
+    skin_type = (filters.get("skin_type") or "all").strip()
+    concerns  = (filters.get("concerns")  or "").strip()
+
+    enriched_query = query
+    if category and category not in ("null", ""):
+        enriched_query = f"{category} {enriched_query}"
+    if skin_type and skin_type not in ("null", "all", ""):
+        enriched_query += f" for {skin_type} skin"
+    if concerns and concerns not in ("null", ""):
+        enriched_query += f" {concerns}"
+
+    # ── SerpAPI with key rotation ─────────────────────────────────────────
+    if SERPAPI_KEYS:
+        _reset_serpapi_rotation()
+
+        while True:
+            api_key = _current_serpapi_key()
+            if api_key is None:
+                print("[SerpAPI] All keys exhausted — falling back to GPT")
+                break
+
+            print(f"[SerpAPI] Trying key ...{api_key[-6:]} | query: {enriched_query!r}")
+            try:
+                organic  = _serpapi_search(enriched_query, api_key, n=n)
+                products = _serpapi_results_to_products(
+                    organic, category, skin_type, concerns
+                )
+                if products:
+                    print(f"[SerpAPI] Got {len(products)} products")
+                    return products
+                else:
+                    print(f"[SerpAPI] Zero results — rotating key")
+                    _rotate_serpapi_key()
+
+            except PermissionError as e:
+                print(f"[SerpAPI] Key invalid/exhausted: {e} — rotating")
+                next_key = _rotate_serpapi_key()
+                if next_key is None:
+                    print("[SerpAPI] No more keys — falling back to GPT")
+                    break
+
+            except Exception as e:
+                print(f"[SerpAPI] Error: {e} — rotating key")
+                next_key = _rotate_serpapi_key()
+                if next_key is None:
+                    print("[SerpAPI] No more keys — falling back to GPT")
+                    break
+
+    else:
+        print("[SerpAPI] No keys configured — using GPT fallback")
+
+    # ── GPT fallback ──────────────────────────────────────────────────────
+    print(f"[GPT fallback] Fetching products for: {query!r}")
+    products = _gpt_product_fallback(query, filters, n=min(n, 6))
+    print(f"[GPT fallback] Got {len(products)} products")
+    return products
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCT RANKING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rank_products(products: list[dict], top_n: int = 4) -> list[dict]:
+    for p in products:
+        rating  = float(p.get("rating", 0) or 0)
+        count   = float(p.get("rating_count", 0) or 0)
+        dist    = float(p.get("_distance", 1.0))
+        quality   = rating * math.log1p(count)
+        relevance = 1.0 / (1.0 + dist)
+        p["_score"] = 0.4 * relevance + 0.6 * (quality / 50.0)
+    return sorted(products, key=lambda x: x["_score"], reverse=True)[:top_n]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -777,22 +1131,22 @@ def query_products(query: str, filters: dict, n_results: int = 12) -> list[dict]
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_affiliate_link(product: dict) -> tuple[str, str]:
-    brand = product.get("brand", "").lower().strip()
+    brand    = product.get("brand", "").lower().strip()
     override = BRAND_AFFILIATE_OVERRIDES.get(brand)
 
-    if override == "cj" and product.get("affiliate_cj"):
-        return product["affiliate_cj"], "CJ"
+    if override == "cj"      and product.get("affiliate_cj"):
+        return product["affiliate_cj"],      "CJ"
     if override == "rakuten" and product.get("affiliate_rakuten"):
         return product["affiliate_rakuten"], "Rakuten"
-    if override == "amazon" and product.get("affiliate_amazon"):
-        return product["affiliate_amazon"], "Amazon"
+    if override == "amazon"  and product.get("affiliate_amazon"):
+        return product["affiliate_amazon"],  "Amazon"
 
     if product.get("affiliate_cj"):
-        return product["affiliate_cj"], "CJ"
+        return product["affiliate_cj"],      "CJ"
     if product.get("affiliate_rakuten"):
         return product["affiliate_rakuten"], "Rakuten"
     if product.get("affiliate_amazon"):
-        return product["affiliate_amazon"], "Amazon"
+        return product["affiliate_amazon"],  "Amazon"
 
     q = (
         (product.get("name", "") + " " + product.get("brand", ""))
@@ -803,22 +1157,9 @@ def get_affiliate_link(product: dict) -> tuple[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRODUCT RANKING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def rank_products(products: list[dict], top_n: int = 4) -> list[dict]:
-    for p in products:
-        rating = float(p.get("rating", 0) or 0)
-        count = float(p.get("rating_count", 0) or 0)
-        dist = float(p.get("_distance", 1.0))
-        quality = rating * math.log1p(count)
-        relevance = 1.0 / (1.0 + dist)
-        p["_score"] = 0.4 * relevance + 0.6 * (quality / 50.0)
-    return sorted(products, key=lambda x: x["_score"], reverse=True)[:top_n]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # PRODUCT CARD RENDERER
+# CHANGE 2 — product image is commented out
+# CHANGE 3 — CSS grid rows ensure all 4 cards are perfectly aligned
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _star_html(rating: float) -> str:
@@ -841,50 +1182,56 @@ def render_product_cards(products: list[dict]):
     )
     if has_affiliate:
         st.markdown(
-            "<p class='f-disclosure'>* Some links are affiliate links — "
-            "Forence may earn a small commission at no extra cost to you.</p>",
+            "<p class='f-disclosure'>* Links open the Amazon product page directly.</p>",
             unsafe_allow_html=True,
         )
 
+    # Use st.columns() for layout — Streamlit renders this correctly inside
+    # st.chat_message, unlike a single large HTML block which gets escaped.
+    # Each card is its own st.markdown() call so HTML is always rendered.
     cols = st.columns(min(len(products), 4))
+
     for col, product in zip(cols, products):
-        with col:
-            affiliate_url, _ = get_affiliate_link(product)
-            rating = float(product.get("rating", 0) or 0)
-            rating_count = int(product.get("rating_count", 0) or 0)
-            price = float(product.get("price", 0) or 0)
-            raw_img = product.get("image_url") or ""
-            # Catch old placeholder URLs from previously-built KBs
-            if not raw_img or "placeholder" in raw_img.lower():
-                image_url = PLACEHOLDER_IMAGE
-            else:
-                image_url = raw_img
-            name = product.get("name", "Unknown Product")
-            brand = product.get("brand", "")
+        affiliate_url, _ = get_affiliate_link(product)
+        rating       = float(product.get("rating", 0) or 0)
+        rating_count = int(product.get("rating_count", 0) or 0)
+        price        = float(product.get("price", 0) or 0)
+        name         = product.get("name", "Unknown Product")
+        brand        = product.get("brand", "")
 
-            if rating > 0:
-                rating_html = (
-                    f"<div class='f-card-stars'>{_star_html(rating)}&nbsp;"
-                    f"<span style='font-size:.78rem;color:#666'>{rating:.1f}</span>"
-                    f"<span class='f-card-rating-count'>&nbsp;({rating_count:,})</span></div>"
-                )
-            else:
-                rating_html = (
-                    "<div class='f-card-stars' style='color:#ddd'>☆☆☆☆☆ "
-                    "<span style='font-size:.7rem;color:#ccc'>not rated</span></div>"
-                )
+        # ── Image tag commented out (CHANGE 2) ────────────────────────────
+        # image_url = product.get("image_url") or ""
+        # if not image_url or "placeholder" in image_url.lower():
+        #     image_url = PLACEHOLDER_IMAGE
+        # img_html = (
+        #     f'<img src="{image_url}" '
+        #     f'onerror="this.onerror=null;this.src=\'{PLACEHOLDER_IMAGE}\'" />'
+        # )
+        # ── End commented-out image block ─────────────────────────────────
 
-            price_html = (
-                f"<div class='f-card-price'>₹{price:,.0f}</div>"
-                if price > 0
-                else "<div class='f-card-price-na'>Price unavailable</div>"
+        if rating > 0:
+            rating_html = (
+                f"<div class='f-card-stars'>{_star_html(rating)}&nbsp;"
+                f"<span style='font-size:.76rem;color:#666'>{rating:.1f}</span>"
+                f"<span class='f-card-rating-count'>&nbsp;({rating_count:,})</span></div>"
+            )
+        else:
+            rating_html = (
+                "<div class='f-card-stars' style='color:#ddd'>☆☆☆☆☆ "
+                "<span style='font-size:.7rem;color:#ccc'>not rated</span></div>"
             )
 
+        price_html = (
+            f"<div class='f-card-price'>₹{price:,.0f}</div>"
+            if price > 0
+            else "<div class='f-card-price-na'>Price unavailable</div>"
+        )
+
+        # Each card is injected individually per column — no cross-column HTML
+        with col:
             st.markdown(
                 f"""
                 <div class="f-card">
-                    <img src="{image_url}"
-                         onerror="this.onerror=null;this.src='{PLACEHOLDER_IMAGE}'" />
                     <div class="f-card-name">{name}</div>
                     <div class="f-card-brand">{brand}</div>
                     {rating_html}
@@ -924,12 +1271,12 @@ def update_profile(profile: dict, updates: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DEFAULTS = {
-    "features": None,
-    "messages": [],
-    "analyzed": False,
+    "features":        None,
+    "messages":        [],
+    "analyzed":        False,
     "face_image_bytes": None,
-    "profile": {},
-    "product_results": {},  # assistant-message-index → list[dict]
+    "profile":         {},
+    "product_results": {},
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -960,17 +1307,19 @@ if not st.session_state.analyzed:
         unsafe_allow_html=True,
     )
 
-    # KB status (small inline notice)
-    _, _, kb_ok = get_chroma_collections()
     if not OPENAI_API_KEY:
         st.error(
             "⚠️ **OPENAI_API_KEY not set.** "
-            "Set it with: `export OPENAI_API_KEY=sk-...`"
+            "Add it to your .env: `OPENAI_API_KEY=sk-...`"
         )
-    elif not kb_ok:
-        st.warning(
-            "⚠️ Knowledge base not found — product recommendations won't work.\n\n"
-            "Run `python generate_kb_v2.py` first to build it."
+
+    if not SERPAPI_KEYS:
+        st.info(
+            "ℹ️ **SERPAPI_KEYS not set** — product search will use GPT fallback.\n\n"
+            "For richer results, add free SerpAPI keys to your .env:\n"
+            "`SERPAPI_KEYS=key1,key2,key3`\n\n"
+            "Get free keys at [serpapi.com](https://serpapi.com) "
+            "(100 searches/month each)."
         )
 
     uploaded_file = st.file_uploader(
@@ -1001,22 +1350,19 @@ if not st.session_state.analyzed:
                     st.session_state.features = features
                     st.session_state.analyzed = True
 
-                    # Persist avatar thumbnail for Phase 2
                     avatar = pil_image.copy()
                     avatar.thumbnail((120, 120), Image.LANCZOS)
                     buf = io.BytesIO()
                     avatar.save(buf, format="PNG")
                     st.session_state.face_image_bytes = buf.getvalue()
 
-                    f = features
-                    shape = f["face_shape"]
-                    undertone = f["skin_color"]["undertone"]
+                    f               = features
+                    shape           = f["face_shape"]
+                    undertone       = f["skin_color"]["undertone"]
                     brightness_label = (
-                        "fair"
-                        if f["skin_color"]["brightness"] > 180
-                        else "medium"
-                        if f["skin_color"]["brightness"] > 100
-                        else "deep"
+                        "fair"   if f["skin_color"]["brightness"] > 180 else
+                        "medium" if f["skin_color"]["brightness"] > 100 else
+                        "deep"
                     )
                     opener = (
                         f"Great news — I've analysed your photo! 🎉\n\n"
@@ -1050,10 +1396,9 @@ else:
         unsafe_allow_html=True,
     )
 
-    # ── Face thumbnail + profile pill ────────────────────────────────────
-    f = st.session_state.features
-    shape = f["face_shape"].capitalize()
-    undertone = f["skin_color"]["undertone"].capitalize()
+    f          = st.session_state.features
+    shape      = f["face_shape"].capitalize()
+    undertone  = f["skin_color"]["undertone"].capitalize()
     brightness = f["skin_color"]["brightness"]
     tone_label = "Fair" if brightness > 180 else "Medium" if brightness > 100 else "Deep"
 
@@ -1066,7 +1411,6 @@ else:
                 output_format="PNG",
             )
     with badge_col:
-        # Show face badge + profile (if accumulated)
         badge_parts = [
             f"🪞 <strong>{shape}</strong> face",
             f"<strong>{tone_label}</strong> skin",
@@ -1090,18 +1434,17 @@ else:
 
     st.divider()
 
-    # ── Render chat history ──────────────────────────────────────────────
+    # ── Render chat history ───────────────────────────────────────────────
     for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            # Re-render product cards for this assistant message
             if (
                 msg["role"] == "assistant"
                 and idx in st.session_state.product_results
             ):
                 render_product_cards(st.session_state.product_results[idx])
 
-    # ── Chat input ───────────────────────────────────────────────────────
+    # ── Chat input ────────────────────────────────────────────────────────
     user_input = st.chat_input("Ask about makeup, skincare, products… ✨")
 
     if user_input:
@@ -1118,36 +1461,34 @@ else:
                     features=st.session_state.features,
                 )
 
-            reply = response_data.get(
-                "reply", "Sorry, something went wrong — try again!"
-            )
+            reply   = response_data.get("reply", "Sorry, something went wrong — try again!")
             signals = response_data.get("signals", {})
 
             st.markdown(reply)
 
-            # Update user profile silently
             updates = signals.get("profile_updates", {})
             if updates:
                 st.session_state.profile = update_profile(
                     st.session_state.profile, updates
                 )
 
-            # Product retrieval + ranking + display
             products_shown: list[dict] = []
 
-            should_show = signals.get("show_products", False) and not signals.get(
-                "needs_clarification", False
-            ) and not signals.get("is_off_topic", False)
+            should_show = (
+                signals.get("show_products", False)
+                and not signals.get("needs_clarification", False)
+                and not signals.get("is_off_topic", False)
+            )
 
             if should_show:
-                product_query = signals.get("product_query") or user_input
+                product_query   = signals.get("product_query") or user_input
                 product_filters = signals.get("product_filters") or {}
 
-                with st.spinner("Finding the best products for you…"):
-                    raw = query_products(
+                with st.spinner("Finding the best products for you on Amazon…"):
+                    raw            = search_products_live(
                         query=product_query,
                         filters=product_filters,
-                        n_results=16,
+                        n=8,
                     )
                     products_shown = rank_products(raw, top_n=4)
 
@@ -1156,10 +1497,9 @@ else:
                 else:
                     st.caption(
                         "*I couldn't find matching products right now — "
-                        "try a different query!*"
+                        "try rephrasing your question!*"
                     )
 
-        # Persist assistant message + product results
         assistant_msg_idx = len(st.session_state.messages)
         st.session_state.messages.append(
             {"role": "assistant", "content": reply}
@@ -1168,7 +1508,7 @@ else:
             st.session_state.product_results[assistant_msg_idx] = products_shown
         st.rerun()
 
-    # ── Reset button ─────────────────────────────────────────────────────
+    # ── Reset button ──────────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Start over with a new photo", type="secondary"):
         for k in _DEFAULTS:
