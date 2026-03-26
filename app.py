@@ -1,9 +1,9 @@
 """
-Forence AI — Beauty Assistant with Face Analysis
+Novontis AI — Beauty Assistant with Face Analysis
 ==================================================
 Combines:
   • MediaPipe face-mesh analysis (shape, skin tone, texture)
-  • Forence warm-persona chatbot with structured JSON signals
+  • Novontis warm-persona chatbot with structured JSON signals
   • LIVE Amazon product search via SerpAPI (key rotation) + GPT fallback
   • Affiliate waterfall (CJ → Rakuten → Amazon → Google fallback)
   • Silent user-profile builder
@@ -60,7 +60,7 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Forence AI — Your Beauty Bestie",
+    page_title="Novontis AI — Your Beauty Bestie",
     page_icon="✨",
     layout="centered",
 )
@@ -558,7 +558,7 @@ def build_system_prompt(profile: dict, features: dict | None) -> str:
                 + "\nUse this context naturally — never announce that you are reading a profile."
             )
 
-    return f"""You are Forence — a warm, knowledgeable, and enthusiastic AI beauty assistant who feels like a best friend that happens to know everything about beauty.
+    return f"""You are Novontis — a warm, knowledgeable, and enthusiastic AI beauty assistant who feels like a best friend that happens to know everything about beauty.
 {face_ctx}{profile_ctx}
 
 YOUR PERSONALITY
@@ -886,7 +886,7 @@ def _serpapi_results_to_products(
     skin_type: str,
     concerns: str,
 ) -> list[dict]:
-    """Convert raw SerpAPI organic results into Forence product dicts."""
+    """Convert raw SerpAPI organic results into Novontis product dicts."""
     products = []
     for i, item in enumerate(organic):
         title = (item.get("title") or "").strip()
@@ -1177,7 +1177,7 @@ def render_product_cards(products: list[dict]):
     )
 
     st.markdown(
-        "<div class='f-section-label'>🛍️ Products Forence thinks you'll love</div>",
+        "<div class='f-section-label'>🛍️ Products Novontis thinks you'll love</div>",
         unsafe_allow_html=True,
     )
     if has_affiliate:
@@ -1287,7 +1287,7 @@ for k, v in _DEFAULTS.items():
 # HEADER
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("<h1>✨ Forence — Your Beauty Bestie</h1>", unsafe_allow_html=True)
+st.markdown("<h1>✨ Novontis — Your Beauty Bestie</h1>", unsafe_allow_html=True)
 st.markdown(
     '<p class="subtitle">Personalised makeup & skincare advice — '
     "powered by your face analysis.</p>",
@@ -1313,14 +1313,14 @@ if not st.session_state.analyzed:
             "Add it to your .env: `OPENAI_API_KEY=sk-...`"
         )
 
-    if not SERPAPI_KEYS:
-        st.info(
-            "ℹ️ **SERPAPI_KEYS not set** — product search will use GPT fallback.\n\n"
-            "For richer results, add free SerpAPI keys to your .env:\n"
-            "`SERPAPI_KEYS=key1,key2,key3`\n\n"
-            "Get free keys at [serpapi.com](https://serpapi.com) "
-            "(100 searches/month each)."
-        )
+    # if not SERPAPI_KEYS:
+    #     st.info(
+    #         "ℹ️ **SERPAPI_KEYS not set** — product search will use GPT fallback.\n\n"
+    #         "For richer results, add free SerpAPI keys to your .env:\n"
+    #         "`SERPAPI_KEYS=key1,key2,key3`\n\n"
+    #         "Get free keys at [serpapi.com](https://serpapi.com) "
+    #         "(100 searches/month each)."
+    #     )
 
     uploaded_file = st.file_uploader(
         "Choose a clear, well-lit face photo",
@@ -1453,7 +1453,7 @@ else:
             st.markdown(user_input)
 
         with st.chat_message("assistant"):
-            with st.spinner("Forence is thinking…"):
+            with st.spinner("Novontis is thinking…"):
                 response_data = get_forence_response(
                     user_input=user_input,
                     history=st.session_state.messages,
